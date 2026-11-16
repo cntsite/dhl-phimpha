@@ -3404,42 +3404,22 @@ alter publication supabase_realtime add table earthwork_progress;</pre>
 
       const isOnline = (currentSupabaseStatus === 'connected');
 
-      if (isAdmin) {
-        // Admin View: Can view details & click to configure
-        if (isOnline) {
-          dot.style.background = '#10b981';
-          btn.style.borderColor = '#10b981';
-          btn.style.color = '#34d399';
-          btn.style.background = 'rgba(16,185,129,0.15)';
-          label.textContent = currentSupabaseDetailText || '☁️ Supabase: ONLINE (Settings)';
-        } else {
-          dot.style.background = '#ef4444';
-          btn.style.borderColor = '#ef4444';
-          btn.style.color = '#f87171';
-          btn.style.background = 'rgba(239,68,68,0.15)';
-          label.textContent = currentSupabaseDetailText || '☁️ Supabase: OFFLINE (Settings)';
-        }
-        btn.style.cursor = 'pointer';
-        btn.title = 'Click to configure Supabase URL and Key';
+      if (isOnline) {
+        dot.style.background = '#10b981';
+        btn.style.borderColor = '#10b981';
+        btn.style.color = '#34d399';
+        btn.style.background = 'rgba(16,185,129,0.15)';
+        label.textContent = 'ONLINE';
+        btn.title = currentSupabaseDetailText || 'Status: Online (Connected to cloud database)';
       } else {
-        // Non-admin / General public: Shows ONLY ONLINE / OFFLINE
-        if (isOnline) {
-          dot.style.background = '#10b981';
-          btn.style.borderColor = '#10b981';
-          btn.style.color = '#34d399';
-          btn.style.background = 'rgba(16,185,129,0.15)';
-          label.textContent = 'ONLINE';
-          btn.title = 'Status: Online (Connected to cloud database)';
-        } else {
-          dot.style.background = '#ef4444';
-          btn.style.borderColor = '#ef4444';
-          btn.style.color = '#f87171';
-          btn.style.background = 'rgba(239,68,68,0.15)';
-          label.textContent = 'OFFLINE';
-          btn.title = 'Status: Offline';
-        }
-        btn.style.cursor = 'pointer';
+        dot.style.background = '#ef4444';
+        btn.style.borderColor = '#ef4444';
+        btn.style.color = '#f87171';
+        btn.style.background = 'rgba(239,68,68,0.15)';
+        label.textContent = 'OFFLINE';
+        btn.title = currentSupabaseDetailText || 'Status: Offline';
       }
+      btn.style.cursor = 'pointer';
     }
 
     async function initSupabase() {
