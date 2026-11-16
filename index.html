@@ -1160,6 +1160,10 @@ alter publication supabase_realtime add table earthwork_progress;</pre>
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path><polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline><line x1="12" y1="22.08" x2="12" y2="12"></line></svg>
             <span>Zone Progress Summary</span>
           </div>
+          <label style="display:flex; align-items:center; gap:5px; font-size:10px; color:#cbd5e1; cursor:pointer; font-weight:600;" title="Show/hide Zone 1-4 pointer labels in 3D">
+            <input type="checkbox" id="chk-show-zone-labels" checked style="accent-color:#38bdf8; cursor:pointer;">
+            <span>3D Labels</span>
+          </label>
         </div>
         <div id="zone-summary-content" style="display:flex; flex-direction:column; gap:8px;">
           <!-- Dynamically populated by updateZoneSummaryKpis() -->
@@ -2687,7 +2691,8 @@ alter publication supabase_realtime add table earthwork_progress;</pre>
       selectedCell: null,
       progressData: {}, // { cellId: { filledZ, date } }
       customTargets: {},
-      cellZones: {}
+      cellZones: {},
+      highlightedZone: null
     };
 
     const bounds = SURVEY_DATA.metadata.bounds;
@@ -3190,6 +3195,12 @@ alter publication supabase_realtime add table earthwork_progress;</pre>
     // ==========================================
     const progressGroup = new THREE.Group();
     scene.add(progressGroup);
+    const zoneLabelsGroup = new THREE.Group();
+    scene.add(zoneLabelsGroup);
+    const zoneHighlightGroup = new THREE.Group();
+    scene.add(zoneHighlightGroup);
+    let zoneHighlightMat = null;
+    let zoneHighlightLineMat = null;
 
     // ==========================================
     // --- SELECTION HIGHLIGHT & BLINKING FRAME ---
@@ -3815,6 +3826,44 @@ alter publication supabase_realtime add table earthwork_progress;</pre>
       } catch (e) {}
     }
 
+    let isAdmin = false;
+    try {
+      if (sessionStorage.getItem('dhl_admin_auth') === 'true' || localStorage.getItem('dhl_admin_auth') === 'true') {
+        isAdmin = true;
+      }
+    } catch (e) {}
+
+    const ZONE_SCHEDULE_STORAGE_KEY = 'dhl_zone_schedules_v1';
+    const DEFAULT_ZONE_SCHEDULES = {
+      '1': { start: '2026-11-20', end: '2026-12-27' },
+      '2': { start: '2026-12-01', end: '2027-02-21' },
+      '3': { start: '2027-02-15', end: '2027-04-10' },
+      '4': { start: '2027-04-19', end: '2027-07-15' }
+    };
+
+    function loadZoneSchedules() {
+      const res = JSON.parse(JSON.stringify(DEFAULT_ZONE_SCHEDULES));
+      try {
+        const raw = localStorage.getItem(ZONE_SCHEDULE_STORAGE_KEY);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          ['1', '2', '3', '4'].forEach(z => {
+            if (parsed[z] && parsed[z].start && parsed[z].end) {
+              res[z] = { start: String(parsed[z].start), end: String(parsed[z].end) };
+            }
+          });
+        }
+      } catch (e) {}
+      return res;
+    }
+    STATE.zoneSchedules = loadZoneSchedules();
+
+    function saveZoneSchedules() {
+      try {
+        localStorage.setItem(ZONE_SCHEDULE_STORAGE_KEY, JSON.stringify(STATE.zoneSchedules));
+      } catch (e) {}
+    }
+
     // Pre-apply targets and zones into cells
     SURVEY_DATA.grid.cells.forEach(c => {
       if (STATE.customTargets[c.id] !== undefined) {
@@ -4085,6 +4134,7 @@ alter publication supabase_realtime add table earthwork_progress;</pre>
           lineMesh,
           topMat,
           lineMat,
+          origLineColor: lineMat.color.getHex(),
           cell: c,
           isRecent
         });
@@ -4127,6 +4177,267 @@ alter publication supabase_realtime add table earthwork_progress;</pre>
       });
 
       updateProgressKpis();
+      buildZoneLabels3D();
+      updateZoneHighlight3D();
+    }
+
+    function updateZoneHighlight3D() {
+      while (zoneHighlightGroup.children.length > 0) {
+        const obj = zoneHighlightGroup.children[0];
+        zoneHighlightGroup.remove(obj);
+        if (obj.geometry) obj.geometry.dispose();
+        if (obj.material) obj.material.dispose();
+      }
+      zoneHighlightMat = null;
+      zoneHighlightLineMat = null;
+
+      // Restore original line colors
+      cellMeshMap.forEach(item => {
+        if (item.lineMat && item.origLineColor !== undefined) {
+          item.lineMat.color.setHex(item.origLineColor);
+        }
+      });
+
+      if (!STATE.highlightedZone || STATE.activeTab !== 'progress') {
+        zoneHighlightGroup.visible = false;
+        return;
+      }
+      zoneHighlightGroup.visible = true;
+
+      const targetZone = STATE.highlightedZone;
+      const ribbonPositions = [];
+      const linePositions = [];
+      const halfW = 0.65; // ~1.3m wide glowing white neon frame
+
+      SURVEY_DATA.grid.cells.forEach(c => {
+        const z = (STATE.cellZones && STATE.cellZones[c.id]) || c.zone;
+        if (z !== targetZone) return;
+
+        const mapItem = cellMeshMap.get(c.id);
+        if (mapItem && mapItem.lineMat) {
+          mapItem.lineMat.color.setHex(0xffffff);
+        }
+
+        const rec = STATE.progressData[c.id];
+        const isFilled = rec && rec.filledZ !== undefined && rec.filledZ !== null && !isNaN(rec.filledZ);
+        const currentZ = isFilled ? rec.filledZ : c.zGround;
+        const pts = c.pts;
+        const n = pts.length;
+        if (n < 3) return;
+
+        for (let i = 0; i < n; i++) {
+          const pA = pts[i];
+          const pB = pts[(i + 1) % n];
+          const dx = pB[0] - pA[0];
+          const dy = pB[1] - pA[1];
+          const len = Math.hypot(dx, dy);
+          if (len < 1e-4) continue;
+
+          // Inward normal approx via centroid
+          let nx = -dy / len;
+          let ny = dx / len;
+          const midX = (pA[0] + pB[0]) * 0.5;
+          const midY = (pA[1] + pB[1]) * 0.5;
+          if ((c.cx - midX) * nx + (c.cy - midY) * ny < 0) {
+            nx = -nx;
+            ny = -ny;
+          }
+
+          const wA = toWorld(pA[0], pA[1], currentZ);
+          const wB = toWorld(pB[0], pB[1], currentZ);
+          const wAIn = toWorld(pA[0] + nx * halfW * 2, pA[1] + ny * halfW * 2, currentZ);
+          const wBIn = toWorld(pB[0] + nx * halfW * 2, pB[1] + ny * halfW * 2, currentZ);
+
+          const yOff = 0.35;
+          // Two triangles forming neon edge ribbon
+          ribbonPositions.push(
+            wA[0], wA[1] + yOff, wA[2],
+            wB[0], wB[1] + yOff, wB[2],
+            wBIn[0], wBIn[1] + yOff, wBIn[2],
+
+            wA[0], wA[1] + yOff, wA[2],
+            wBIn[0], wBIn[1] + yOff, wBIn[2],
+            wAIn[0], wAIn[1] + yOff, wAIn[2]
+          );
+
+          const lineY = 0.42;
+          linePositions.push(
+            wA[0], wA[1] + lineY, wA[2],
+            wB[0], wB[1] + lineY, wB[2]
+          );
+        }
+      });
+
+      if (ribbonPositions.length > 0) {
+        const ribGeom = new THREE.BufferGeometry();
+        ribGeom.setAttribute('position', new THREE.Float32BufferAttribute(ribbonPositions, 3));
+        zoneHighlightMat = new THREE.MeshBasicMaterial({
+          color: 0xffffff,
+          transparent: true,
+          opacity: 0.9,
+          side: THREE.DoubleSide,
+          depthWrite: false
+        });
+        const ribMesh = new THREE.Mesh(ribGeom, zoneHighlightMat);
+        ribMesh.renderOrder = 16;
+        zoneHighlightGroup.add(ribMesh);
+      }
+
+      if (linePositions.length > 0) {
+        const lGeom = new THREE.BufferGeometry();
+        lGeom.setAttribute('position', new THREE.Float32BufferAttribute(linePositions, 3));
+        zoneHighlightLineMat = new THREE.LineBasicMaterial({
+          color: 0xffffff,
+          transparent: true,
+          opacity: 1.0
+        });
+        const lMesh = new THREE.LineSegments(lGeom, zoneHighlightLineMat);
+        lMesh.renderOrder = 17;
+        zoneHighlightGroup.add(lMesh);
+      }
+    }
+
+    function buildZoneLabels3D() {
+      // Clear previous zone pointer labels
+      while (zoneLabelsGroup.children.length > 0) {
+        const obj = zoneLabelsGroup.children[0];
+        zoneLabelsGroup.remove(obj);
+        if (obj.geometry) obj.geometry.dispose();
+        if (obj.material) {
+          if (obj.material.map) obj.material.map.dispose();
+          obj.material.dispose();
+        }
+      }
+
+      const chkLabels = document.getElementById('chk-show-zone-labels');
+      if (chkLabels && !chkLabels.checked) {
+        zoneLabelsGroup.visible = false;
+        zoneHighlightGroup.visible = false;
+        return;
+      }
+      zoneLabelsGroup.visible = (STATE.activeTab === 'progress');
+
+      const cells = SURVEY_DATA.grid.cells;
+      const zoneStyles = {
+        '1': { color: '#38bdf8', hex: 0x38bdf8, defaultCenter: [1693.0, 4674.4] },
+        '2': { color: '#f59e0b', hex: 0xf59e0b, defaultCenter: [1851.6, 4537.8] },
+        '3': { color: '#10b981', hex: 0x10b981, defaultCenter: [2063.5, 4617.8] },
+        '4': { color: '#a855f7', hex: 0xa855f7, defaultCenter: [1931.2, 4965.1] }
+      };
+
+      const scales = typeof getZoneScaleFactors === 'function' ? getZoneScaleFactors() : { '1': 1, '2': 1, '3': 1, '4': 1 };
+
+      ['1', '2', '3', '4'].forEach(z => {
+        const st = zoneStyles[z];
+        const zoneCells = cells.filter(c => ((STATE.cellZones && STATE.cellZones[c.id]) || c.zone) === z);
+        if (zoneCells.length === 0) return;
+
+        let ax = 0, ay = 0, aSum = 0, vModelFilled = 0;
+        zoneCells.forEach(c => {
+          ax += c.cx * c.area;
+          ay += c.cy * c.area;
+          aSum += c.area;
+          const rec = STATE.progressData[c.id];
+          if (rec && rec.filledZ !== undefined && rec.filledZ !== null && !isNaN(rec.filledZ)) {
+            vModelFilled += Math.max(0, Math.min(rec.filledZ, c.targetZ) - c.zGround) * c.area;
+          }
+        });
+
+        const cx = aSum > 0 ? (ax / aSum) : st.defaultCenter[0];
+        const cy = aSum > 0 ? (ay / aSum) : st.defaultCenter[1];
+        const zSurf = getElevationAt(cx, cy);
+        const wpBase = toWorld(cx, cy, zSurf);
+
+        const poleHeight = 36;
+        const baseY = wpBase[1] + 0.6;
+        const topY = baseY + poleHeight;
+
+        // 1. Anchor Dot on surface
+        const dotGeom = new THREE.SphereGeometry(2.4, 16, 16);
+        const dotMat = new THREE.MeshBasicMaterial({ color: st.hex });
+        const dotMesh = new THREE.Mesh(dotGeom, dotMat);
+        dotMesh.position.set(wpBase[0], baseY, wpBase[2]);
+        dotMesh.renderOrder = 18;
+        zoneLabelsGroup.add(dotMesh);
+
+        // 2. Anchor Ring on surface
+        const ringGeom = new THREE.RingGeometry(3.2, 5.2, 24);
+        ringGeom.rotateX(-Math.PI / 2);
+        const ringMat = new THREE.MeshBasicMaterial({ color: st.hex, transparent: true, opacity: 0.75, side: THREE.DoubleSide });
+        const ringMesh = new THREE.Mesh(ringGeom, ringMat);
+        ringMesh.position.set(wpBase[0], baseY + 0.2, wpBase[2]);
+        ringMesh.renderOrder = 18;
+        zoneLabelsGroup.add(ringMesh);
+
+        // 3. Vertical Pointer Stem
+        const stemGeom = new THREE.BufferGeometry().setFromPoints([
+          new THREE.Vector3(wpBase[0], baseY, wpBase[2]),
+          new THREE.Vector3(wpBase[0], topY, wpBase[2])
+        ]);
+        const stemMat = new THREE.LineBasicMaterial({ color: st.hex, transparent: true, opacity: 0.9 });
+        const stemLine = new THREE.Line(stemGeom, stemMat);
+        stemLine.renderOrder = 19;
+        zoneLabelsGroup.add(stemLine);
+
+        // 4. Callout Badge Sprite
+        const vTarget = (typeof ZONE_TARGET_VOLUMES !== 'undefined' && ZONE_TARGET_VOLUMES[z]) ? ZONE_TARGET_VOLUMES[z] : aSum;
+        const vFilled = vModelFilled * (scales[z] || 1);
+        const pct = vTarget > 0 ? Math.min(100, (vFilled / vTarget) * 100) : 0;
+
+        const canvas = document.createElement('canvas');
+        canvas.width = 320;
+        canvas.height = 112;
+        const ctx = canvas.getContext('2d');
+
+        // Dark rounded pill background
+        ctx.fillStyle = 'rgba(13, 20, 34, 0.92)';
+        if (ctx.roundRect) {
+          ctx.beginPath();
+          ctx.roundRect(6, 6, 308, 100, 18);
+          ctx.fill();
+          ctx.strokeStyle = st.color;
+          ctx.lineWidth = 4;
+          ctx.stroke();
+        } else {
+          ctx.fillRect(6, 6, 308, 100);
+          ctx.strokeStyle = st.color;
+          ctx.lineWidth = 4;
+          ctx.strokeRect(6, 6, 308, 100);
+        }
+
+        // Colored accent dot
+        ctx.fillStyle = st.color;
+        ctx.beginPath();
+        ctx.arc(38, 40, 10, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Main Title: ZONE X
+        ctx.font = '800 34px "Segoe UI", Roboto, sans-serif';
+        ctx.fillStyle = '#ffffff';
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('ZONE ' + z, 58, 41);
+
+        // Right-aligned % badge
+        ctx.font = '700 24px "Segoe UI", Roboto, sans-serif';
+        ctx.fillStyle = st.color;
+        ctx.textAlign = 'right';
+        ctx.fillText(pct.toFixed(1) + '%', 294, 41);
+
+        // Subtitle: cell count & target volume
+        ctx.font = '600 20px "Segoe UI", Roboto, sans-serif';
+        ctx.fillStyle = '#94a3b8';
+        ctx.textAlign = 'left';
+        ctx.fillText(zoneCells.length + ' cells  •  ' + Math.round(vTarget).toLocaleString() + ' m³', 28, 80);
+
+        const tex = new THREE.CanvasTexture(canvas);
+        const spriteMat = new THREE.SpriteMaterial({ map: tex, depthTest: false });
+        const sprite = new THREE.Sprite(spriteMat);
+        sprite.position.set(wpBase[0], topY + 10, wpBase[2]);
+        sprite.scale.set(58, 20, 1);
+        sprite.renderOrder = 25;
+        zoneLabelsGroup.add(sprite);
+      });
     }
 
 
@@ -4153,6 +4464,39 @@ alter publication supabase_realtime add table earthwork_progress;</pre>
       return scales;
     }
 
+    function formatShortDate(isoStr) {
+      if (!isoStr) return '-';
+      const parts = isoStr.split('-');
+      if (parts.length !== 3) return isoStr;
+      return parts[2] + '/' + parts[1] + '/' + parts[0].slice(-2);
+    }
+
+    function getZonePlanStats(z, vTarget) {
+      const sched = (STATE.zoneSchedules && STATE.zoneSchedules[z]) || DEFAULT_ZONE_SCHEDULES[z];
+      const sDate = new Date(sched.start + 'T00:00:00');
+      const eDate = new Date(sched.end + 'T23:59:59');
+      const now = new Date();
+      const today = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 12, 0, 0);
+
+      let planPct = 0;
+      if (!isNaN(sDate.getTime()) && !isNaN(eDate.getTime()) && eDate > sDate) {
+        if (today >= eDate) {
+          planPct = 100;
+        } else if (today > sDate) {
+          const totalMs = eDate.getTime() - sDate.getTime();
+          const elapsedMs = today.getTime() - sDate.getTime();
+          planPct = Math.min(100, Math.max(0, (elapsedMs / totalMs) * 100));
+        }
+      }
+      const planVol = vTarget * (planPct / 100);
+      return {
+        start: sched.start,
+        end: sched.end,
+        planPct: planPct,
+        planVol: planVol
+      };
+    }
+
     function updateZoneSummaryKpis() {
       const container = document.getElementById('zone-summary-content');
       if (!container) return;
@@ -4165,17 +4509,25 @@ alter publication supabase_realtime add table earthwork_progress;</pre>
         '4': '#a855f7'  // Violet
       };
 
-      let html = '';
       const zones = ['1', '2', '3', '4'];
       const scales = getZoneScaleFactors();
-      
+
+      let totalAllTarget = 0;
+      let totalAllActual = 0;
+      let totalAllPlan = 0;
+      let cardsHtml = '';
+
       zones.forEach(function(z) {
         const zoneCells = cells.filter(function(c) { return STATE.cellZones && STATE.cellZones[c.id] === z; });
         const zColor = zoneColors[z] || '#38bdf8';
         const totalCount = zoneCells.length;
+        const vTarget = ZONE_TARGET_VOLUMES[z] || 0;
+        const plan = getZonePlanStats(z, vTarget);
+        totalAllTarget += vTarget;
+        totalAllPlan += plan.planVol;
 
         if (totalCount === 0) {
-          html += '<div style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.06); border-radius:8px; padding:6px 10px; display:flex; justify-content:space-between; align-items:center;">' +
+          cardsHtml += '<div style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.06); border-radius:8px; padding:6px 10px; display:flex; justify-content:space-between; align-items:center;">' +
             '<span style="font-size:11px; font-weight:700; color:' + zColor + '; display:flex; align-items:center; gap:6px;">' +
             '<span style="width:7px; height:7px; border-radius:50%; background:' + zColor + '; opacity:0.6;"></span>' +
             'Zone ' + z +
@@ -4192,7 +4544,6 @@ alter publication supabase_realtime add table earthwork_progress;</pre>
 
         zoneCells.forEach(function(c) {
           aTotal += c.area;
-
           const rec = STATE.progressData[c.id];
           if (rec && rec.filledZ !== undefined && rec.filledZ !== null && !isNaN(rec.filledZ)) {
             filledCount++;
@@ -4202,37 +4553,135 @@ alter publication supabase_realtime add table earthwork_progress;</pre>
           }
         });
 
-        const vTarget = ZONE_TARGET_VOLUMES[z];
         const vFilled = vModelFilled * (scales[z] || 1);
+        totalAllActual += vFilled;
         const volPct = vTarget > 0 ? Math.min(100, (vFilled / vTarget) * 100) : 0;
         const areaPct = aTotal > 0 ? Math.min(100, (aFilled / aTotal) * 100) : 0;
+        const diffPct = volPct - plan.planPct;
 
-        html += '<div style="background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.1); border-radius:8px; padding:8px 10px;">' +
+        let statusBadge = '';
+        if (plan.planPct <= 0.01 && volPct <= 0.01) {
+          statusBadge = '<span style="font-size:9px; font-weight:700; color:#94a3b8; background:rgba(148,163,184,0.14); padding:1px 6px; border-radius:4px;">Upcoming</span>';
+        } else if (diffPct >= -0.05) {
+          statusBadge = '<span style="font-size:9px; font-weight:700; color:#34d399; background:rgba(16,185,129,0.16); padding:1px 6px; border-radius:4px;">Ahead +' + Math.max(0, diffPct).toFixed(1) + '%</span>';
+        } else {
+          statusBadge = '<span style="font-size:9px; font-weight:700; color:#fb7185; background:rgba(244,63,94,0.16); padding:1px 6px; border-radius:4px;">Behind ' + diffPct.toFixed(1) + '%</span>';
+        }
+
+        let scheduleRowHtml = '';
+        if (isAdmin) {
+          scheduleRowHtml = '<div style="display:flex; align-items:center; justify-content:space-between; gap:4px; margin-bottom:6px; padding:4px 6px; background:rgba(15,23,42,0.75); border:1px solid rgba(56,189,248,0.25); border-radius:6px;">' +
+            '<span style="font-size:9px; color:#38bdf8; font-weight:700; white-space:nowrap;">Plan:</span>' +
+            '<input type="date" class="zone-sched-input" data-zone="' + z + '" data-field="start" value="' + plan.start + '" style="background:#090e17; color:#e2e8f0; border:1px solid #334155; border-radius:4px; padding:1px 3px; font-size:10px; font-family:var(--font-sans); width:96px; color-scheme:dark;">' +
+            '<span style="font-size:9px; color:#64748b;">-</span>' +
+            '<input type="date" class="zone-sched-input" data-zone="' + z + '" data-field="end" value="' + plan.end + '" style="background:#090e17; color:#e2e8f0; border:1px solid #334155; border-radius:4px; padding:1px 3px; font-size:10px; font-family:var(--font-sans); width:96px; color-scheme:dark;">' +
+            '</div>';
+        } else {
+          scheduleRowHtml = '<div style="font-size:10px; color:#94a3b8; display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;">' +
+            '<span>Schedule:</span>' +
+            '<span style="color:#cbd5e1; font-weight:600;">' + formatShortDate(plan.start) + ' – ' + formatShortDate(plan.end) + '</span>' +
+            '</div>';
+        }
+
+        const isHighlighted = (STATE.highlightedZone === z);
+        const cardStyle = isHighlighted
+          ? 'background:rgba(255,255,255,0.10); border:1.5px solid #ffffff; box-shadow:0 0 14px rgba(255,255,255,0.35); cursor:pointer; transition:all 0.2s;'
+          : 'background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.1); cursor:pointer; transition:all 0.2s;';
+        cardsHtml += '<div class="zone-summary-card-item" data-zone="' + z + '" title="Click to blink white neon grid border for Zone ' + z + '" style="' + cardStyle + ' border-radius:8px; padding:8px 10px;">' +
           '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;">' +
-          '<span style="font-size:11px; font-weight:700; color:' + zColor + '; display:flex; align-items:center; gap:6px;">' +
+          '<span style="font-size:11px; font-weight:700; color:' + zColor + '; display:flex; align-items:center; gap:5px;">' +
           '<span style="width:8px; height:8px; border-radius:50%; background:' + zColor + '; box-shadow:0 0 6px ' + zColor + ';"></span>' +
           'Zone ' + z +
-          '<span style="font-size:10px; font-weight:500; color:#cbd5e1; background:rgba(255,255,255,0.08); padding:1px 6px; border-radius:4px;">' +
-          filledCount + ' / ' + totalCount + ' cells' +
+          '<span style="font-size:10px; font-weight:500; color:#cbd5e1; background:rgba(255,255,255,0.08); padding:1px 5px; border-radius:4px;">' +
+          filledCount + '/' + totalCount +
           '</span>' +
           '</span>' +
-          '<span style="font-size:11px; font-weight:700; color:#10b981;">' + volPct.toFixed(1) + '%</span>' +
+          '<div style="display:flex; align-items:center; gap:5px;">' +
+          statusBadge +
+          '<span style="font-size:11px; font-weight:800; color:#10b981;">' + volPct.toFixed(1) + '%</span>' +
+          '</div>' +
+          '</div>' +
+          scheduleRowHtml +
+          '<div style="font-size:10px; color:var(--text-muted); display:flex; justify-content:space-between; margin-bottom:2px;">' +
+          '<span>Actual:</span>' +
+          '<b style="color:#f8fafc;">' + Math.round(vFilled).toLocaleString() + ' / ' + Math.round(vTarget).toLocaleString() + ' m³</b>' +
           '</div>' +
           '<div style="font-size:10px; color:var(--text-muted); display:flex; justify-content:space-between; margin-bottom:2px;">' +
-          '<span>Filled Volume:</span>' +
-          '<b style="color:#f8fafc;">' + Math.round(vFilled).toLocaleString() + ' / ' + Math.round(vTarget).toLocaleString() + ' m³</b>' +
+          '<span>Planned (Today):</span>' +
+          '<b style="color:#cbd5e1;">' + Math.round(plan.planVol).toLocaleString() + ' m³ (' + plan.planPct.toFixed(1) + '%)</b>' +
           '</div>' +
           '<div style="font-size:10px; color:var(--text-muted); display:flex; justify-content:space-between; margin-bottom:6px;">' +
           '<span>Filled Area:</span>' +
-          '<b style="color:#f8fafc;">' + Math.round(aFilled).toLocaleString() + ' / ' + Math.round(aTotal).toLocaleString() + ' m² (' + areaPct.toFixed(1) + '%)</b>' +
+          '<b style="color:#94a3b8;">' + Math.round(aFilled).toLocaleString() + ' / ' + Math.round(aTotal).toLocaleString() + ' m² (' + areaPct.toFixed(1) + '%)</b>' +
           '</div>' +
-          '<div style="height:4px; width:100%; background:rgba(255,255,255,0.1); border-radius:2px; overflow:hidden;">' +
-          '<div style="height:100%; width:' + volPct.toFixed(1) + '%; background:' + zColor + '; transition:width 0.4s ease;"></div>' +
+          '<!-- Dual Gauge: Actual vs Plan -->' +
+          '<div style="position:relative; height:6px; width:100%; background:rgba(255,255,255,0.08); border-radius:3px; overflow:visible; margin-bottom:3px;" title="Actual: ' + volPct.toFixed(1) + '%">' +
+          '<div style="height:100%; width:' + volPct.toFixed(1) + '%; background:' + zColor + '; border-radius:3px; transition:width 0.4s ease;"></div>' +
+          (plan.planPct > 0 ? '<div style="position:absolute; top:-2px; bottom:-2px; left:' + plan.planPct.toFixed(1) + '%; width:2px; background:#f8fafc; box-shadow:0 0 4px rgba(255,255,255,0.9); z-index:2;" title="Plan Target Today: ' + plan.planPct.toFixed(1) + '%"></div>' : '') +
+          '</div>' +
+          '<div style="height:3px; width:100%; background:rgba(255,255,255,0.05); border-radius:2px; overflow:hidden;" title="Planned: ' + plan.planPct.toFixed(1) + '%">' +
+          '<div style="height:100%; width:' + plan.planPct.toFixed(1) + '%; background:#94a3b8; transition:width 0.4s ease;"></div>' +
+          '</div>' +
+          '<div style="display:flex; justify-content:space-between; font-size:9px; color:#64748b; margin-top:2px;">' +
+          '<span>■ Actual</span>' +
+          '<span>■ Plan (' + plan.planPct.toFixed(1) + '%)</span>' +
           '</div>' +
           '</div>';
       });
 
-      container.innerHTML = html;
+      const totalPlanPct = totalAllTarget > 0 ? Math.min(100, (totalAllPlan / totalAllTarget) * 100) : 0;
+      const totalActPct = totalAllTarget > 0 ? Math.min(100, (totalAllActual / totalAllTarget) * 100) : 0;
+      const totalDiff = totalActPct - totalPlanPct;
+
+      const overallHeaderHtml = '<div style="background:rgba(56,189,248,0.07); border:1px solid rgba(56,189,248,0.22); border-radius:8px; padding:7px 10px; margin-bottom:2px;">' +
+        '<div style="display:flex; justify-content:space-between; align-items:center; font-size:10px; margin-bottom:4px;">' +
+        '<span style="color:#7dd3fc; font-weight:700;">Overall Plan vs Actual</span>' +
+        '<span style="font-weight:700; color:' + (totalDiff >= -0.05 ? '#34d399' : '#fb7185') + ';">' + (totalPlanPct <= 0.01 && totalActPct <= 0.01 ? 'Upcoming' : (totalDiff >= 0 ? 'Ahead +' : 'Behind ') + totalDiff.toFixed(1) + '%') + '</span>' +
+        '</div>' +
+        '<div style="display:flex; justify-content:space-between; font-size:10px; color:#cbd5e1; margin-bottom:4px;">' +
+        '<span>Plan: <b>' + Math.round(totalAllPlan).toLocaleString() + ' m³</b> (' + totalPlanPct.toFixed(1) + '%)</span>' +
+        '<span>Act: <b style="color:#38bdf8;">' + Math.round(totalAllActual).toLocaleString() + ' m³</b> (' + totalActPct.toFixed(1) + '%)</span>' +
+        '</div>' +
+        '<div style="position:relative; height:5px; width:100%; background:rgba(255,255,255,0.08); border-radius:3px;">' +
+        '<div style="height:100%; width:' + totalActPct.toFixed(1) + '%; background:#38bdf8; border-radius:3px;"></div>' +
+        (totalPlanPct > 0 ? '<div style="position:absolute; top:-2px; bottom:-2px; left:' + totalPlanPct.toFixed(1) + '%; width:2px; background:#f8fafc;"></div>' : '') +
+        '</div>' +
+        '</div>';
+
+      container.innerHTML = overallHeaderHtml + cardsHtml;
+
+      // Bind Zone card click to toggle 3D white neon border blinking
+      container.querySelectorAll('.zone-summary-card-item').forEach(function(card) {
+        card.addEventListener('click', function(e) {
+          if (e.target.closest('input')) return;
+          const z = card.getAttribute('data-zone');
+          STATE.highlightedZone = (STATE.highlightedZone === z) ? null : z;
+          updateZoneSummaryKpis();
+          updateZoneHighlight3D();
+          if (STATE.highlightedZone) {
+            showToast('✨ Highlighting Zone ' + z + ' grids (click card again to turn off)', 2200);
+          }
+        });
+      });
+
+      // Bind Admin schedule date editors
+      if (isAdmin) {
+        container.querySelectorAll('.zone-sched-input').forEach(function(inp) {
+          inp.addEventListener('change', function() {
+            if (!isAdmin) return;
+            const z = inp.getAttribute('data-zone');
+            const field = inp.getAttribute('data-field');
+            const val = inp.value;
+            if (!val || !STATE.zoneSchedules[z]) return;
+            STATE.zoneSchedules[z][field] = val;
+            saveZoneSchedules();
+            updateZoneSummaryKpis();
+            showToast('📅 Updated Zone ' + z + ' schedule', 2000);
+          });
+        });
+      }
+
+      if (typeof buildZoneLabels3D === 'function') buildZoneLabels3D();
     }
 
     function updateProgressKpis() {
@@ -4330,14 +4779,6 @@ alter publication supabase_realtime add table earthwork_progress;</pre>
     // --- ADMIN AUTH & TARGET ELEVATION SYSTEM ---
     // ==========================================
     const ADMIN_CREDENTIALS = { id: 'admin', pwd: '11873' };
-    let isAdmin = false;
-
-    // Check if admin is currently logged in (persisted in session)
-    try {
-      if (sessionStorage.getItem('dhl_admin_auth') === 'true' || localStorage.getItem('dhl_admin_auth') === 'true') {
-        isAdmin = true;
-      }
-    } catch (e) {}
 
     const adminLoginModal = document.getElementById('admin-login-modal');
     const adminInputId = document.getElementById('admin-input-id');
@@ -4362,8 +4803,9 @@ alter publication supabase_realtime add table earthwork_progress;</pre>
         renderDrawerPermissions(STATE.selectedCell);
       }
 
-      // Refresh Supabase Badge display according to admin privileges
+      // Refresh Supabase Badge & Zone Schedule Editors according to admin privileges
       updateSupabaseBadge();
+      if (typeof updateZoneSummaryKpis === 'function') updateZoneSummaryKpis();
     }
 
     function openAdminModal() {
@@ -4769,6 +5211,9 @@ alter publication supabase_realtime add table earthwork_progress;</pre>
         progressSidebarSection.style.display = 'block';
         if (surveySidebarSection) surveySidebarSection.style.display = 'none';
         progressGroup.visible = true;
+        const chkZL = document.getElementById('chk-show-zone-labels');
+        zoneLabelsGroup.visible = chkZL ? chkZL.checked : true;
+        updateZoneHighlight3D();
         if (contourLineSegments) contourLineSegments.material.opacity = 0.30;
         
         // Progress tracking mode: Monochrome Grayscale terrain + 50% Opacity
@@ -4792,6 +5237,7 @@ alter publication supabase_realtime add table earthwork_progress;</pre>
         STATE.selectedCell = null;
         clearSelectionHighlight();
         progressGroup.visible = false;
+        zoneLabelsGroup.visible = false;
         if (contourLineSegments) contourLineSegments.material.opacity = 0.95;
 
         // Survey mode: Restore vibrant Colormap + full Opacity
@@ -4829,6 +5275,16 @@ alter publication supabase_realtime add table earthwork_progress;</pre>
         camera.position.set(radius * 1.1, radius * 0.25, 0);
       }
       camera.lookAt(0, 0, 0);
+      // Gentle white neon grid frame pulse for selected Zone 1-4 card
+      if (STATE.activeTab === 'progress' && STATE.highlightedZone && zoneHighlightMat) {
+        const time = clock.getElapsedTime();
+        const wave = (Math.sin(time * 3.2) + 1) / 2; // smooth, subtle pulse
+        zoneHighlightMat.opacity = 0.45 + 0.45 * wave;
+        if (zoneHighlightLineMat) {
+          zoneHighlightLineMat.opacity = 0.60 + 0.40 * wave;
+        }
+      }
+
       controls.update();
     }
 
@@ -5603,7 +6059,13 @@ alter publication supabase_realtime add table earthwork_progress;</pre>
 
     document.getElementById('sel-colormap').addEventListener('change', (e) => {
       STATE.colormap = e.target.value;
-      updateLegendBar();
+      const chkShowZoneLabels = document.getElementById('chk-show-zone-labels');
+    if (chkShowZoneLabels) {
+      chkShowZoneLabels.addEventListener('change', () => {
+        buildZoneLabels3D();
+      });
+    }
+    updateLegendBar();
       updateTerrainGeometry();
     });
 
